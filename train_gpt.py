@@ -277,7 +277,17 @@ class CausalSelfAttention(nn.Module):
             v = self.lambdas[0] * v
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=0.12).transpose(1, 2)
+        CUSTOM_KERNEL = {
+            "BLOCK_M": 64, "BLOCK_N": 64,  # forward
+            "BLOCK_M1": 32, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 32,  # backwards
+        }
+        y = flex_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            block_mask=block_mask, scale=0.12,
+            kernel_options=CUSTOM_KERNEL
+        ).transpose(1, 2)
+
+        #y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=0.12).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
@@ -444,8 +454,8 @@ class Hyperparameters:
     train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 48*1024 # FlexAttention sequence length
-    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
+    train_seq_len = 6*1024 # FlexAttention sequence length
+    val_seq_len = 4*8*1024 # FlexAttention sequence length for validation
     # optimization
     num_iterations = 1770 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
@@ -457,9 +467,10 @@ class Hyperparameters:
 args = Hyperparameters()
 
 # torchrun sets these env variables
+print('setting config')
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert world_size == 8 # this code is designed for 8xH100
+#assert world_size == 8 # this code is designed for 8xH100
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -497,6 +508,8 @@ print0("="*100)
 #    Construct model and optimizer     #
 ########################################
 
+print('constructing model')
+
 model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=12, num_heads=6, model_dim=768,
                        max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
 for m in model.modules():
@@ -512,6 +525,7 @@ scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
 # init the optimizer(s)
+print('init optimizer')
 adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
@@ -544,13 +558,14 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(1728 * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
-model: nn.Module = torch.compile(model, dynamic=False)
+model: nn.Module = torch.compile(model, dynamic=False, mode="max-autotune")
 
 ########################################
 #            Warmup kernels            #
 ########################################
 
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
+print('starting warmup')
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
@@ -571,12 +586,14 @@ del initial_state
 #        Training and validation       #
 ########################################
 
+print('init trainloader')
 train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
+print('begin training')
 train_steps = args.num_iterations
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
