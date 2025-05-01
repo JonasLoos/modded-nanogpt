@@ -29,7 +29,8 @@ git clone https://github.com/KellerJordan/modded-nanogpt.git && cd modded-nanogp
 pip install -r requirements.txt
 pip install --pre torch==2.7.0.dev20250310+cu126 --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade
 python data/cached_fineweb10B.py 8 # downloads only the first 800M training tokens to save time
-./run.sh
+#./run.sh
+torchrun --standalone --nproc_per_node=1 train_gpt.py
 ```
 
 **Note: torch.compile will add around 5 minutes of latency the first time you run the code.**
